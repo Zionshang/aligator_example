@@ -46,9 +46,16 @@ using SolverProxDDP = aligator::SolverProxDDPTpl<double>;
 
 struct MPCSettings
 {
-    
-};
+    MatrixXd w_x;        // 状态权重
+    MatrixXd w_u;        // 输入权重
+    MatrixXd w_foot;     // 腿的平移权重
+    MatrixXd w_cent_mom; // 角动量导数权重
 
+    double dt = 20e-3;                        // Timestep
+    double mu = 0.8;                          // Friction coefficient
+    Vector3d gravity = Vector3d(0, 0, -9.81); // Gravity
+    int force_size = 3;                       // 接触力维度
+};
 
 // t_ss 为完整步长周期，ts 为当前步长
 double ztraj(double swing_apex, double t_ss, double ts)
@@ -61,43 +68,40 @@ double xtraj(double x_forward, double t_ss, double ts)
     return x_forward * ts / t_ss;
 }
 
-StageModel createStage(MultibodyPhaseSpace space, int nu, Vector3d gravity,
+StageModel createStage(const MultibodyPhaseSpace &space, int nu,
                        std::vector<bool> contact_states,
                        std::vector<FrameIndex> contact_ids,
-                       int force_size,
-                       VectorXd x0, MatrixXd w_x,
-                       VectorXd u0, MatrixXd w_u,
-                       MatrixXd w_cent_mom,
-                       std::vector<Vector3d> cont_pos, MatrixXd w_trans, double dt,
-                       double mu)
+                       VectorXd x0, VectorXd u0,
+                       std::vector<Vector3d> cont_pos,
+                       const MPCSettings &mpc_settings)
 {
     const Model &model = space.getModel();
     CostStack cost(space, nu);
-    CentroidalMomentumDerivativeResidual cent_mom_deriv(space.ndx(), model, gravity,
-                                                        contact_states, contact_ids, force_size);
+    CentroidalMomentumDerivativeResidual cent_mom_deriv(space.ndx(), model, mpc_settings.gravity,
+                                                        contact_states, contact_ids, mpc_settings.force_size);
 
-    cost.addCost(QuadraticStateCost(space, nu, x0, w_x));
-    cost.addCost(QuadraticControlCost(space, u0, w_u));
-    cost.addCost(QuadraticResidualCost(space, cent_mom_deriv, w_cent_mom));
+    cost.addCost(QuadraticStateCost(space, nu, x0, mpc_settings.w_x));
+    cost.addCost(QuadraticControlCost(space, u0, mpc_settings.w_u));
+    cost.addCost(QuadraticResidualCost(space, cent_mom_deriv, mpc_settings.w_cent_mom));
 
     for (size_t i = 0; i < cont_pos.size(); i++)
     {
         if (!contact_states[i]) // 只考虑摆动腿轨迹跟踪
         {
             FrameTranslationResidual frame_res(space.ndx(), nu, model, cont_pos[i], contact_ids[i]);
-            cost.addCost(QuadraticResidualCost(space, frame_res, w_trans));
+            cost.addCost(QuadraticResidualCost(space, frame_res, mpc_settings.w_foot));
         }
     }
 
-    KinodynamicsFwdDynamics ode(space, model, gravity, contact_states, contact_ids, force_size);
-    IntegratorEuler dyn_model(ode, dt);
+    KinodynamicsFwdDynamics ode(space, model, mpc_settings.gravity, contact_states, contact_ids, mpc_settings.force_size);
+    IntegratorEuler dyn_model(ode, mpc_settings.dt);
     StageModel stage_model(cost, dyn_model);
 
     for (size_t i = 0; i < contact_states.size(); i++)
     {
         if (contact_states[i])
         {
-            CentroidalFrictionConeResidual friction_residual(space.ndx(), nu, i, mu, 1e-5);
+            CentroidalFrictionConeResidual friction_residual(space.ndx(), nu, i, mpc_settings.mu, 1e-5);
             stage_model.addConstraint(friction_residual, NegativeOrthant());
             FrameTranslationResidual frame_res(space.ndx(), nu, model, cont_pos[i], contact_ids[i]);
             stage_model.addConstraint(frame_res, EqualityConstraint());
@@ -108,37 +112,33 @@ StageModel createStage(MultibodyPhaseSpace space, int nu, Vector3d gravity,
 
 int main(int argc, char const *argv[])
 {
+    ////////////////////////// 生成模型 //////////////////////////////
     std::string urdf_path = getProjectPath() + "/robot/galileo_mini/robot.urdf";
     Model model;
     pinocchio::urdf::buildModel(urdf_path, model);
     Data data(model);
+    MPCSettings mpc_settings;
+    const int nq = model.nq;
+    const int nv = model.nv;
+    const int force_size = mpc_settings.force_size;
+    const int nc = 4;                        // contact number
+    const int nu = nv - 6 + nc * force_size; // input number
+    MultibodyPhaseSpace space(model);
+    const int ndx = space.ndx();
 
+    ////////////////////////// 生成初始状态 //////////////////////////////
     VectorXd q0(model.nq);
     q0 << 0, 0, 0.38, 0, 0, 0, 1,
         0, 0.72, -1.44,
         0, 0.72, -1.44,
         0, 0.72, -1.44,
         0, 0.72, -1.44;
-
-    const int nq = model.nq;
-    const int nv = model.nv;
-    const int force_size = 3;
-    const int nc = 4;                        // contact number
-    const int nu = nv - 6 + nc * force_size; // input number
-
-    MultibodyPhaseSpace space(model);
-    const int ndx = space.ndx();
-
     VectorXd x0(nq + nv);
     x0 << q0, VectorXd::Zero(nv);
     VectorXd u0 = VectorXd::Zero(nu);
     Vector3d com0 = pinocchio::centerOfMass(model, data, x0.head(nq));
-
-    double dt = 20e-3;             // Timestep
-    Vector3d gravity(0, 0, -9.81); // Gravity
-    double mu = 0.8;               // Friction coefficient
     double mass = pinocchio::computeTotalMass(model);
-    Vector3d f_ref(0, 0, -mass * gravity[2] / 4.0); // Initial contact force
+    Vector3d f_ref(0, 0, -mass * mpc_settings.gravity[2] / 4.0);
 
     const FrameIndex FL_id = model.getFrameId("FL_foot_link", pinocchio::BODY);
     const FrameIndex FR_id = model.getFrameId("FR_foot_link", pinocchio::BODY);
@@ -152,24 +152,23 @@ int main(int argc, char const *argv[])
     SE3 FR_pose = data.oMf[FR_id];
     SE3 HL_pose = data.oMf[HL_id];
     SE3 HR_pose = data.oMf[HR_id];
+    std::vector<Vector3d> current_feet_pos = {FL_pose.translation(), FR_pose.translation(),
+                                              HL_pose.translation(), HR_pose.translation()};
 
+    ////////////////////////// 生成权重 //////////////////////////////
     VectorXd wx_diag = VectorXd::Ones(space.ndx()) * 1e-2;
     wx_diag.head(3).setZero();
-    MatrixXd w_x = wx_diag.asDiagonal();              // 状态权重
-    MatrixXd w_u = 1e-6 * MatrixXd::Identity(nu, nu); // 输入权重
-    VectorXd w_trans_diag = VectorXd::Ones(3) * 100;  // 腿的平移权重
-    MatrixXd w_trans = w_trans_diag.asDiagonal();
+    wx_diag.segment(3, 3).setOnes();
+    VectorXd w_foot_diag = VectorXd::Ones(3) * 100;
     VectorXd w_cent_mom_diag = VectorXd::Ones(6) * 1e-3;
-    MatrixXd w_cent_mom = w_cent_mom_diag.asDiagonal();
+    mpc_settings.w_x = wx_diag.asDiagonal();
+    mpc_settings.w_u = 1e-6 * MatrixXd::Identity(nu, nu);
+    mpc_settings.w_foot = w_foot_diag.asDiagonal();
+    mpc_settings.w_cent_mom = w_cent_mom_diag.asDiagonal();
 
     ////////////////////////// 添加生成接触状态与位姿 //////////////////////////////
     std::vector<std::vector<Vector3d>> contact_poses;
     std::vector<std::vector<bool>> contact_states;
-
-    // 初始化当前各足平移
-    std::vector<Vector3d> now_trans = {
-        FL_pose.translation(), FR_pose.translation(),
-        HL_pose.translation(), HR_pose.translation()};
 
     const int n_qs = 5;  // 离散时刻的全接触支持数量
     const int n_ds = 40; // 离散时刻的双足接触支持数量
@@ -185,21 +184,21 @@ int main(int argc, char const *argv[])
         for (int j = 0; j < n_qs; ++j)
         {
             contact_states.push_back({true, true, true, true});
-            contact_poses.push_back(now_trans); // 全接触支持时，各足平移不变
+            contact_poses.push_back(current_feet_pos); // 全接触支持时，各足平移不变
         }
         // 第二阶段：第一组双足接触（例如 swing 第 0 和 3 号足）
         for (int j = 0; j < n_ds; ++j)
         {
             contact_states.push_back({false, true, true, false});
-            std::vector<Eigen::Vector3d> new_trans = now_trans;
-            new_trans[0](0) = xtraj(x_forward, n_ds, j) + now_trans[0](0);
-            new_trans[0](2) = ztraj(swing_apex, n_ds, j) + now_trans[0](2);
-            new_trans[3](0) = xtraj(x_forward, n_ds, j) + now_trans[3](0);
-            new_trans[3](2) = ztraj(swing_apex, n_ds, j) + now_trans[3](2);
-            contact_poses.push_back(new_trans);
+            std::vector<Eigen::Vector3d> target_feet_pos = current_feet_pos;
+            target_feet_pos[0](0) = xtraj(x_forward, n_ds, j) + current_feet_pos[0](0);
+            target_feet_pos[0](2) = ztraj(swing_apex, n_ds, j) + current_feet_pos[0](2);
+            target_feet_pos[3](0) = xtraj(x_forward, n_ds, j) + current_feet_pos[3](0);
+            target_feet_pos[3](2) = ztraj(swing_apex, n_ds, j) + current_feet_pos[3](2);
+            contact_poses.push_back(target_feet_pos);
             if (j == n_ds - 1)
             {
-                now_trans = new_trans;
+                current_feet_pos = target_feet_pos;
             }
         }
 
@@ -207,22 +206,22 @@ int main(int argc, char const *argv[])
         for (int j = 0; j < n_qs; ++j)
         {
             contact_states.push_back({true, true, true, true});
-            contact_poses.push_back(now_trans);
+            contact_poses.push_back(current_feet_pos);
         }
 
         // 第四阶段：第二组双足接触（例如 swing 第 1 和 2 号足）
         for (int j = 0; j < n_ds; ++j)
         {
             contact_states.push_back({true, false, false, true});
-            std::vector<Eigen::Vector3d> new_trans = now_trans;
-            new_trans[1](0) = xtraj(x_forward, n_ds, j) + now_trans[1](0);
-            new_trans[1](2) = ztraj(swing_apex, n_ds, j) + now_trans[1](2);
-            new_trans[2](0) = xtraj(x_forward, n_ds, j) + now_trans[2](0);
-            new_trans[2](2) = ztraj(swing_apex, n_ds, j) + now_trans[2](2);
-            contact_poses.push_back(new_trans);
+            std::vector<Eigen::Vector3d> target_feet_pos = current_feet_pos;
+            target_feet_pos[1](0) = xtraj(x_forward, n_ds, j) + current_feet_pos[1](0);
+            target_feet_pos[1](2) = ztraj(swing_apex, n_ds, j) + current_feet_pos[1](2);
+            target_feet_pos[2](0) = xtraj(x_forward, n_ds, j) + current_feet_pos[2](0);
+            target_feet_pos[2](2) = ztraj(swing_apex, n_ds, j) + current_feet_pos[2](2);
+            contact_poses.push_back(target_feet_pos);
             if (j == n_ds - 1)
             {
-                now_trans = new_trans;
+                current_feet_pos = target_feet_pos;
             }
         }
     }
@@ -230,12 +229,12 @@ int main(int argc, char const *argv[])
     int nsteps = contact_states.size(); // 离散时刻的数量
 
     CostStack term_cost(space, nu);
-    term_cost.addCost(QuadraticStateCost(space, nu, x0, 10 * w_x)); // ? 为什么是x0
+    term_cost.addCost(QuadraticStateCost(space, nu, x0, 10 * mpc_settings.w_x));
     std::vector<xyz::polymorphic<StageModel>> stages;
     for (size_t i = 0; i < nsteps; i++)
     {
-        stages.push_back(createStage(space, nu, gravity, contact_states[i], feet_id, force_size,
-                                     x0, w_x, u0, w_u, w_cent_mom, contact_poses[i], w_trans, dt, mu));
+        stages.push_back(createStage(space, nu, contact_states[i], feet_id,
+                                     x0, u0, contact_poses[i], mpc_settings));
     }
     TrajOptProblem problem(x0, stages, term_cost);
 
